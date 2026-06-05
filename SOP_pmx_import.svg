@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect x="4" y="4" width="56" height="56" rx="10" fill="#2b6cb0"/>
+  <rect x="4" y="4" width="56" height="56" rx="10" fill="none" stroke="#1a4d80" stroke-width="2"/>
+  <text x="32" y="40" font-family="Arial, sans-serif" font-size="20" font-weight="bold"
+        text-anchor="middle" fill="#ffffff">PMX</text>
+</svg>
