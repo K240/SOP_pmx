@@ -6,11 +6,15 @@
 #include "pmx_parser.h"
 
 #include <CH/CH_Manager.h>
+#include <GA/GA_ElementGroup.h>
 #include <GA/GA_Handle.h>
+#include <GA/GA_Iterator.h>
 #include <GA/GA_Types.h>
 #include <GEO/GEO_Detail.h>
 #include <GU/GU_Detail.h>
 #include <GU/GU_DetailHandle.h>
+#include <GU/GU_PackedGeometry.h>
+#include <GU/GU_PrimPacked.h>
 #include <GU/GU_PrimPoly.h>
 #include <OP/OP_Operator.h>
 #include <OP/OP_OperatorTable.h>
@@ -31,6 +35,7 @@
 #include <UT/UT_XformOrder.h>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "pmx_parser.h"
@@ -102,6 +107,12 @@ static const char *theDsFile = R"THEDSFILE(
         type    toggle
         default { "1" }
     }
+    parm {
+        name    "blendshapes"
+        label   "Import Blend Shapes"
+        type    toggle
+        default { "1" }
+    }
 }
 )THEDSFILE";
 
@@ -147,6 +158,10 @@ SOP_pmx_reader::cookVerb() const
 {
     return SOP_pmx_readerVerb::theVerb.get();
 }
+
+// Defined later; appends the KineFX blend-shape packed prims to the mesh detail.
+static void buildBlendshapes(GU_Detail *dst, const pmx::Model &model,
+    const sop_pmx::Xform &xf, bool sanitize);
 
 // Build the coordinate / unit transform. `convert` enables left-handed ->
 // right-handed (Z flip) plus unit scaling; Original keeps raw data.
@@ -196,6 +211,7 @@ SOP_pmx_readerVerb::cook(const SOP_NodeVerb::CookParms &cookparms) const
     const bool sanitize = sopparms.getSanitizenames();
     const float unit_meters = (float)sopparms.getUnitmeters();
     const bool do_skin = sopparms.getSkinning();
+    const bool do_blendshapes = sopparms.getBlendshapes();
 
     UT_AutoInterrupt progress("Importing PMX mesh");
 
@@ -233,6 +249,9 @@ SOP_pmx_readerVerb::cook(const SOP_NodeVerb::CookParms &cookparms) const
     GA_RWHandleV3 n_h(detail->addNormalAttribute(GA_ATTRIB_POINT, GA_STORE_REAL32));
     GA_RWHandleV3 uv_h(detail->addFloatTuple(GA_ATTRIB_POINT, "uv", 3));
     GA_RWHandleF edge_h(detail->addFloatTuple(GA_ATTRIB_POINT, "pmx_edgescale", 1));
+    // Stable point id (= PMX vertex index) for blendshape / morph correspondence
+    // (the Morphs output references it via `id`; blendshapes ptidattr = "id").
+    GA_RWHandleI id_h(detail->addIntTuple(GA_ATTRIB_POINT, "id", 1));
 
     const int auv = model.header.additional_uv;
     UT_Array<GA_RWHandleV4> auv_h;
@@ -274,6 +293,8 @@ SOP_pmx_readerVerb::cook(const SOP_NodeVerb::CookParms &cookparms) const
         const GA_Offset off = start + i;
         const pmx::Vertex &v = model.vertices[(size_t)i];
         detail->setPos3(off, xf.pos(v.position));
+        if (id_h.isValid())
+            id_h.set(off, (int)i);
         if (n_h.isValid())
             n_h.set(off, xf.nml(v.normal));
         if (uv_h.isValid())
@@ -465,6 +486,11 @@ SOP_pmx_readerVerb::cook(const SOP_NodeVerb::CookParms &cookparms) const
     GA_RWHandleDict dict_h(detail->addDictTuple(GA_ATTRIB_DETAIL, "pmx", 1));
     if (dict_h.isValid())
         dict_h.set(GA_Offset(0), UT_OptionsHolder(&info));
+
+    // Merge KineFX Character Blend Shapes into the mesh as hidden packed prims,
+    // so output 0 feeds straight into `Character Blend Shapes` (Rest Geometry).
+    if (do_blendshapes)
+        buildBlendshapes(detail, model, xf, sanitize);
 
     detail->bumpAllDataIds();
 }
@@ -891,10 +917,92 @@ static const char *morphTypeName(pmx::MorphType t)
     }
 }
 
-// Output 4: vertex/UV morph deltas as a sparse point cloud (one point per target
-// vertex, carrying morph name/index and the delta). Non-deform morphs (group/
-// bone/material/flip/impulse) and display frames are catalogued in detail dict
-// arrays `pmx_morphs` and `pmx_display_frames`.
+// KineFX Character Blend Shapes, merged into the Mesh output (0). Matches the
+// stock format (verified against the SimpleCharacterBlendShapes example): the
+// base mesh primitives carry `name` = the skin id; each vertex morph becomes a
+// packed primitive of LOOSE POINTS (point `id` = base vertex index, `P` = the
+// absolute morphed position) with `name` = the same skin id, `blendshape_channel`
+// = "<morph>", `blendshape_name` = "<skin>.<morph>", placed in the
+// `_3d_hidden_primitives` group. The Character Blend Shapes channels node links a
+// blend shape to its skin by the shared `name`. Appends to `dst` (does NOT clear).
+static void
+buildBlendshapes(GU_Detail *dst, const pmx::Model &model, const sop_pmx::Xform &xf, bool sanitize)
+{
+    if (model.morphs.empty())
+        return;
+
+    std::vector<std::string> mbases;
+    mbases.reserve(model.morphs.size());
+    for (const pmx::Morph &mo : model.morphs)
+        mbases.push_back(sop_pmx::encodeName(!mo.name_local.empty() ? mo.name_local : mo.name_universal, sanitize));
+    const std::vector<std::string> mnames = sop_pmx::deduplicate(std::move(mbases), "morph_");
+
+    const std::string skin = sop_pmx::skinName(model);
+    const UT_StringHolder skin_h(skin.c_str(), (exint)skin.length());
+    const int nv = (int)model.vertices.size();
+
+    // Base mesh primitives identify their skin via `name`.
+    GA_RWHandleS name_h(dst->addStringTuple(GA_ATTRIB_PRIMITIVE, "name", 1));
+    if (name_h.isValid())
+        for (GA_Iterator it(dst->getPrimitiveRange()); !it.atEnd(); ++it)
+            name_h.set(*it, skin_h);
+
+    GA_RWHandleS chan_h(dst->addStringTuple(GA_ATTRIB_PRIMITIVE, "blendshape_channel", 1));
+    GA_RWHandleS bsname_h(dst->addStringTuple(GA_ATTRIB_PRIMITIVE, "blendshape_name", 1));
+    GA_RWHandleF weight_h(dst->addFloatTuple(GA_ATTRIB_PRIMITIVE, "weight", 1));
+    GA_PrimitiveGroup *hidden = dst->newPrimitiveGroup("_3d_hidden_primitives");
+
+    for (size_t mi = 0; mi < model.morphs.size(); ++mi)
+    {
+        const pmx::Morph &mo = model.morphs[mi];
+        if (mo.vertex.empty())   // only vertex morphs map to P blendshapes
+            continue;
+
+        // Embedded blend target: loose points at the absolute morphed position.
+        GU_Detail *emb = new GU_Detail();
+        GA_RWHandleI eid_h(emb->addIntTuple(GA_ATTRIB_POINT, "id", 1));
+        for (const pmx::VertexMorphOffset &vo : mo.vertex)
+        {
+            if (vo.vertex < 0 || vo.vertex >= nv)
+                continue;
+            const GA_Offset pt = emb->appendPoint();
+            const pmx::Vec3 &b = model.vertices[(size_t)vo.vertex].position;
+            emb->setPos3(pt, xf.pos(pmx::Vec3{ b.x + vo.offset.x, b.y + vo.offset.y, b.z + vo.offset.z }));
+            if (eid_h.isValid())
+                eid_h.set(pt, vo.vertex);
+        }
+        if (emb->getNumPoints() == 0)
+        {
+            delete emb;
+            continue;
+        }
+
+        GU_DetailHandle emb_gdh;
+        emb_gdh.allocateAndSet(emb, true);
+        GU_PrimPacked *pack = GU_PackedGeometry::packGeometry(*dst, GU_ConstDetailHandle(emb_gdh));
+        if (!pack)
+            continue;
+        const GA_Offset primoff = pack->getMapOffset();
+        const std::string &shape = mnames[mi];
+        const std::string channel = shape;             // shape name only
+        const std::string bsname = skin + "." + shape; // "<skin>.<shape>"
+        if (name_h.isValid())
+            name_h.set(primoff, skin_h);
+        if (chan_h.isValid())
+            chan_h.set(primoff, UT_StringHolder(channel.c_str(), (exint)channel.length()));
+        if (bsname_h.isValid())
+            bsname_h.set(primoff, UT_StringHolder(bsname.c_str(), (exint)bsname.length()));
+        if (weight_h.isValid())
+            weight_h.set(primoff, 0.0f);
+        if (hidden)
+            hidden->addOffset(primoff);
+    }
+}
+
+// Output 4 (Morphs): vertex/UV morph deltas as a point cloud (one point per
+// (morph, affected vertex): `morph_name`/`morph_index`/`morph_type`/`vtx`/`delta`/
+// `uv_delta`). Non-deform morphs (group/bone/material/flip/impulse) and display
+// frames are catalogued in detail dict arrays `pmx_morphs` / `pmx_display_frames`.
 static void
 buildMorphs(GU_Detail *dst, const pmx::Model &model, const sop_pmx::Xform &xf, bool sanitize)
 {
@@ -908,14 +1016,13 @@ buildMorphs(GU_Detail *dst, const pmx::Model &model, const sop_pmx::Xform &xf, b
         mbases.push_back(sop_pmx::encodeName(!mo.name_local.empty() ? mo.name_local : mo.name_universal, sanitize));
     const std::vector<std::string> mnames = sop_pmx::deduplicate(std::move(mbases), "morph_");
 
+    const int nv = (int)model.vertices.size();
     GA_RWHandleS pmname_h(dst->addStringTuple(GA_ATTRIB_POINT, "morph_name", 1));
     GA_RWHandleI pmidx_h(dst->addIntTuple(GA_ATTRIB_POINT, "morph_index", 1));
     GA_RWHandleI ptype_h(dst->addIntTuple(GA_ATTRIB_POINT, "morph_type", 1));
     GA_RWHandleI pvtx_h(dst->addIntTuple(GA_ATTRIB_POINT, "vtx", 1));
     GA_RWHandleV3 delta_h(dst->addFloatTuple(GA_ATTRIB_POINT, "delta", 3));
     GA_RWHandleV4 uvdelta_h(dst->addFloatTuple(GA_ATTRIB_POINT, "uv_delta", 4));
-
-    const int nv = (int)model.vertices.size();
 
     for (size_t mi = 0; mi < model.morphs.size(); ++mi)
     {

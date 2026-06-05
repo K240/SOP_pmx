@@ -163,6 +163,21 @@ computeBoneNames(const pmx::Model &model, bool sanitize)
     return deduplicate(std::move(bases), "bone_");
 }
 
+// Skin identifier used by KineFX Character Blend Shapes: the base mesh
+// primitives carry it as `name`, and each blend shape's packed prim repeats it
+// as `name` plus `blendshape_channel = "<skin>.<shape>"`. Always a clean token.
+inline std::string
+skinName(const pmx::Model &model)
+{
+    std::string n = !model.header.model_name_local.empty()
+        ? model.header.model_name_local
+        : model.header.model_name_universal;
+    n = encodeName(n, true);
+    if (n.empty())
+        n = "geometry";
+    return n;
+}
+
 // Deterministic, collision-free rigid body names (used by the joints output to
 // reference bodies by name).
 inline std::vector<std::string>

@@ -90,3 +90,14 @@ elseif( WIN32 AND _houdini_win_dso_installdir )
 else()
     houdini_configure_target( ${library_name} )
 endif()
+
+# Windows + OneDrive Files On-Demand: a freshly built DSO in a OneDrive-backed
+# user dir can be dehydrated/evicted to the cloud, which makes Houdini load it
+# intermittently (the operator shows up as "Invalid node type name"). Pin it
+# on-device after every build so it stays a real local file.
+if( WIN32 )
+    add_custom_command( TARGET ${library_name} POST_BUILD
+        COMMAND cmd /c attrib +P -U "$<TARGET_FILE:${library_name}>"
+        COMMENT "Pinning DSO on-device (OneDrive Files On-Demand)"
+        VERBATIM )
+endif()
